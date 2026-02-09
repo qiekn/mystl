@@ -1,4 +1,6 @@
 # My Standard Template Library
 
-Online Notes: [https://qiekn.github.io/mystl/](https://qiekn.github.io/mystl/)  
-Temp Personal Notes: [https://qiekn.notion.site/mystl](https://qiekn.notion.site/mystl)
+MySTL Docs & Notes: [https://qiekn.github.io/mystl/](https://qiekn.github.io/mystl/)  
+
+Dev Notes: [https://qiekn.notion.site/mystl](https://qiekn.notion.site/mystl)
+STL Notes: [https://qiekn.notion.site/stl](https://qiekn.notion.site/stl)
