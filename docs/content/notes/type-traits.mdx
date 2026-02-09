@@ -1,0 +1,147 @@
+---
+title: "type_traits - 类型萃取"
+date: "2025-02-09"
+tags: ["stl", "template", "type-traits"]
+order: 1
+---
+
+## 为什么需要 type_traits？
+
+在 C++ 模板编程中，我们经常需要在**编译期**判断类型的特性。例如：
+
+- 这个类型是不是整数？
+- 这个类型是不是指针？
+- 这个类型有没有平凡析构函数？
+
+根据这些信息，我们可以选择不同的实现策略，提高运行效率。
+
+## 核心问题
+
+假设我们要实现一个 `destroy` 函数来析构对象：
+
+```cpp
+template <class T>
+void destroy(T* ptr) {
+    ptr->~T();  // 调用析构函数
+}
+```
+
+**问题**：对于 `int`、`double` 这种基本类型，析构函数是"平凡的"（什么都不做）。虽然调用不会出错，但完全是浪费。
+
+**目标**：如果能在编译期知道一个类型是否有平凡析构函数，就可以跳过不必要的调用。
+
+## 解决方案：把值变成类型
+
+C++ 模板可以根据「类型」选择不同实现（函数重载），但不能直接根据「值」选择。
+
+解决方案是把 `true` / `false` 这个"值"包装成"类型"：
+
+```cpp
+// 把 true 包装成类型
+struct true_type {
+    static constexpr bool value = true;
+};
+
+// 把 false 包装成类型
+struct false_type {
+    static constexpr bool value = false;
+};
+```
+
+然后用函数重载来分派：
+
+```cpp
+template <class T>
+void destroy_impl(T* ptr, true_type) {
+    // 平凡类型，什么都不做
+}
+
+template <class T>
+void destroy_impl(T* ptr, false_type) {
+    ptr->~T();  // 非平凡类型，调用析构
+}
+```
+
+## integral_constant
+
+与其分别定义 `true_type`、`false_type`，不如写一个通用模板：
+
+```cpp
+template <class T, T v>
+struct integral_constant {
+    static constexpr T value = v;
+};
+```
+
+- `T` - 常量的类型（如 `bool`、`int`）
+- `v` - 常量的值
+
+### 命名解释
+
+- **integral** - 虽然词源和"整数"相关，但这里意思是"完整的"
+- **constant** - 常量
+
+**integral_constant** = "编译期常量"
+
+### 基于它定义 bool 相关类型
+
+```cpp
+// 简化 bool 类型的使用
+template <bool B>
+using bool_constant = integral_constant<bool, B>;
+
+// 定义 true_type 和 false_type
+using true_type = bool_constant<true>;
+using false_type = bool_constant<false>;
+```
+
+## 完整实现
+
+```cpp
+#pragma once
+
+namespace mystl {
+
+template <class T, T v>
+struct integral_constant {
+  static constexpr T value = v;
+};
+
+template <bool B>
+using bool_constant = integral_constant<bool, B>;
+
+using true_type = bool_constant<true>;
+using false_type = bool_constant<false>;
+
+}  // namespace mystl
+```
+
+## 单元测试
+
+```cpp
+#include "type_traits.h"
+#include <gtest/gtest.h>
+
+TEST(TypeTraitsTest, IntegralConstant) {
+  using five = mystl::integral_constant<int, 5>;
+  EXPECT_EQ(five::value, 5);
+
+  using char_a = mystl::integral_constant<char, 'a'>;
+  EXPECT_EQ(char_a::value, 'a');
+}
+
+TEST(TypeTraitsTest, TrueTypeAndFalseType) {
+  EXPECT_TRUE(mystl::true_type::value);
+  EXPECT_FALSE(mystl::false_type::value);
+}
+```
+
+## 后续扩展
+
+有了这个基础，后续可以实现更多类型萃取：
+
+- `is_same<T, U>` - 判断两个类型是否相同
+- `is_pointer<T>` - 判断是否是指针
+- `is_pair<T>` - 判断是否是 pair 类型
+
+这些都会继承自 `true_type` 或 `false_type`。
