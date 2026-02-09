@@ -17,13 +17,19 @@ struct random_access_iterator_tag : public bidirectional_iterator_tag {};
 
 // =============================================================================
 // Iterator Base
-// 自定义迭代器可以继承这个基类，自动获得五个类型定义
+// 自定义迭代器可以继承这个基类，自动获得五个必要的类型定义
 // =============================================================================
 
 // TODO: 实现 iterator 基类模板
-// template <class Category, class T, class Distance = ptrdiff_t,
-//           class Pointer = T*, class Reference = T&>
-// struct iterator { ... };
+template <class Category, class T, class Distance = ptrdiff_t,
+          class Pointer = T*, class Reference = T&>
+struct iterator {
+  typedef Category  iterator_category;  // 迭代器类型
+  typedef T         value_type;         // 元素类型
+  typedef Distance  difference_type;    // 距离类型
+  typedef Pointer   pointer;            // 指针类型
+  typedef Reference reference;          // 引用类型
+};
 
 // =============================================================================
 // Iterator Traits
