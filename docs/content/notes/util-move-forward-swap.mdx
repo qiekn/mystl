@@ -352,7 +352,7 @@ forward<string>(arg)
 → 返回右值引用 → 调用移动构造 ✓
 ```
 
-#### move vs forward 的本质区别
+### move vs forward 的本质区别
 
 - **move** 用 `remove_reference_t` 先去掉引用再加 `&&`，无条件得到右值
 - **forward** 直接用 `T&&` 配合引用折叠，根据 `T` 的不同有条件地保留原始值类别
