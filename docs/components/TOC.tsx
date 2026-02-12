@@ -104,7 +104,7 @@ export function TableOfContents({ enabled = true }: TableOfContentsProps) {
                 href={`#${heading.id}`}
                 onClick={(e) => handleClick(e, heading.id)}
                 className={`block py-1 px-2 rounded transition-colors ${
-                  heading.level === 3 ? "pl-4" : ""
+                  heading.level === 3 ? "pl-6" : ""
                 } ${
                   activeId === heading.id
                     ? "text-accent"

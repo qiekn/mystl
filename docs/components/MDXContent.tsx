@@ -24,7 +24,7 @@ async function CodeBlock({
 // Inline code (`code`)
 function InlineCode({ children }: { children?: React.ReactNode }) {
   return (
-    <code className="rounded bg-neutral-100 dark:bg-neutral-800 font-mono">
+    <code className="rounded px-1.5 py-0.5 bg-neutral-200 dark:bg-neutral-800 font-mono text-[0.875em]">
       {children}
     </code>
   );
