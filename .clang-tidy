@@ -12,7 +12,8 @@ Checks: >
   -google-readability-casting,
   -bugprone-easily-swappable-parameters,
   -performance-no-int-to-ptr,
-  -google-readability-todo
+  -google-readability-todo,
+  -google-readability-braces-around-statements
 
 # Treat all warnings as errors (Optional, but recommended for strict compliance)
 # WarningsAsErrors: '*'
