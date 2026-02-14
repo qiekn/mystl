@@ -1,0 +1,427 @@
+---
+title: "list.h - 双向链表"
+date: "2025-02-14"
+tags: ["stl", "container", "list", "linked-list", "sentinel"]
+order: 7
+toc: true
+---
+
+## 为什么需要 list？
+
+vector 的中间插入和删除是 O(n)——需要搬移后面所有元素。如果你的场景是频繁在中间插入/删除，vector 就不合适了。
+
+`list` 是双向链表，任何位置的插入和删除都是 O(1)。代价是不支持随机访问（没有 `operator[]`），而且每个元素都要单独分配内存。
+
+| 操作 | vector | list |
+|------|--------|------|
+| 随机访问 `[n]` | O(1) | O(n) |
+| 头部插入/删除 | O(n) | O(1) |
+| 尾部插入/删除 | 摊还 O(1) | O(1) |
+| 中间插入/删除 | O(n) | O(1)（已有迭代器时） |
+| 内存布局 | 连续，缓存友好 | 分散，缓存不友好 |
+
+## 核心概念：节点与哨兵
+
+### 两层节点设计
+
+list 的每个元素存在一个独立的节点中。节点分两层：
+
+```cpp
+// 基类：只有指针
+struct list_node_base {
+    list_node_base* prev;
+    list_node_base* next;
+};
+
+// 数据节点：继承基类，加上数据
+template <class T>
+struct list_node : list_node_base {
+    T data;
+};
+```
+
+内存布局：
+
+```
+list_node_base（哨兵用这个）：
+[ prev (8B) ][ next (8B) ]
+              共 16 字节
+
+list_node<string>（数据节点用这个）：
+[ prev (8B) ][ next (8B) ][ data (32B) ]
+  ↑ 继承自 base ↑           ↑ 新增的  ↑
+```
+
+为什么要分两层？因为 list 需要一个**哨兵节点（sentinel）**——不存数据，只做锚点。用 `list_node_base` 作为哨兵类型，不需要构造一个无意义的 `T` 对象。
+
+继承的好处：`list_node<T>*` 可以隐式转换为 `list_node_base*`，所以数据节点和哨兵可以用同一套 prev/next 指针互相连接。
+
+### 哨兵节点
+
+list 内部维护一个哨兵 `sentinel_`，所有数据节点和哨兵构成**双向循环链表**：
+
+```
+空 list：
+    sentinel ←→ sentinel（prev 和 next 都指向自己）
+
+有 3 个元素的 list：
+    sentinel ←→ [1] ←→ [2] ←→ [3] ←→ sentinel
+                 ↑                      ↑
+               begin()                end()
+```
+
+- `begin()` = `sentinel_.next`（第一个数据节点）
+- `end()` = `&sentinel_`（哨兵本身）
+
+哨兵是**栈上的对象**（list 的成员变量），不是堆分配的。所有数据节点才是堆分配的。
+
+```cpp
+private:
+    list_node_base sentinel_;   // 栈上
+    size_type size_;            // 额外维护大小
+```
+
+`sizeof(list)` = 两个指针 + 一个 size_t = 24 字节（64 位系统），和 vector 一样。
+
+## 迭代器
+
+vector 的迭代器是 `T*`——内存连续，`++it` 就是地址加 `sizeof(T)`。list 的节点分散在堆上，`++it` 需要跟着 `next` 指针走，所以迭代器必须封装成类：
+
+```cpp
+template <class T>
+struct list_iterator {
+    list_node_base* node;   // 内部就一个指针
+
+    // 解引用：向下转型拿 data
+    reference operator*() const {
+        return static_cast<list_node<T>*>(node)->data;
+    }
+
+    // ++：跟着 next 走
+    list_iterator& operator++() {
+        node = node->next;
+        return *this;
+    }
+
+    // --：跟着 prev 走
+    list_iterator& operator--() {
+        node = node->prev;
+        return *this;
+    }
+};
+```
+
+三个关键点：
+
+1. **`node` 类型是 `list_node_base*`，不是 `list_node<T>*`** — 因为迭代器可能指向哨兵（`end()` 就是哨兵），哨兵是 `list_node_base`
+2. **解引用时 `static_cast` 向下转型** — 基类指针转成派生类指针才能访问 `data`
+3. **category 是 `bidirectional_iterator_tag`** — 只支持前进和后退，不支持 `it + n`
+
+### const_iterator
+
+vector 的 `const_iterator` 就是 `const T*`，编译器自动处理 `T*` 到 `const T*` 的转换。list 的迭代器是自定义类，必须手动提供转换：
+
+```cpp
+template <class T>
+struct list_const_iterator {
+    const list_node_base* node;
+
+    // 允许从非 const 迭代器隐式转换
+    list_const_iterator(const list_iterator<T>& it) : node(it.node) {}
+
+    const T& operator*() const {
+        return static_cast<const list_node<T>*>(node)->data;
+    }
+};
+```
+
+## 哨兵如何统一插入/删除
+
+这是 list 设计最优雅的部分。没有哨兵的话，头部插入和中间插入需要分开处理：
+
+```cpp
+// 没有哨兵（伪代码）
+void insert_before(node* pos, node* new_node) {
+    if (pos == head_) {
+        // 头部特判
+        new_node->next = head_;
+        head_->prev = new_node;
+        head_ = new_node;
+    } else {
+        // 通用逻辑
+        new_node->next = pos;
+        new_node->prev = pos->prev;
+        pos->prev->next = new_node;  // 如果 pos 是头，pos->prev 是 nullptr，崩溃！
+        pos->prev = new_node;
+    }
+}
+```
+
+有了哨兵，每个节点都有前驱和后继，不存在 `nullptr`：
+
+```cpp
+void link_before(const list_node_base* pos, list_node_base* new_node) {
+    list_node_base* p = const_cast<list_node_base*>(pos);
+    new_node->next = p;
+    new_node->prev = p->prev;
+    p->prev->next = new_node;
+    p->prev = new_node;
+}
+```
+
+四行代码，头部、尾部、中间，都不需要 if 判断。
+
+### 图解 push_back
+
+空 list，执行 `push_back(1)`——在哨兵前面插入：
+
+```
+之前：  sentinel ←→ sentinel
+
+link_before(sentinel, [1])：
+  [1].next = sentinel
+  [1].prev = sentinel.prev = sentinel（空 list 指向自己）
+  sentinel.next = [1]
+  sentinel.prev = [1]
+
+之后：  sentinel ←→ [1] ←→ sentinel
+```
+
+继续 `push_back(2)`：
+
+```
+之前：  sentinel ←→ [1] ←→ sentinel
+
+link_before(sentinel, [2])：
+  [2].next = sentinel
+  [2].prev = sentinel.prev = [1]
+  [1].next = [2]
+  sentinel.prev = [2]
+
+之后：  sentinel ←→ [1] ←→ [2] ←→ sentinel
+```
+
+### insert 和 erase
+
+有了 `link_before`，insert 就是"创建节点 + link + size++"：
+
+```cpp
+iterator insert(const_iterator pos, const value_type& value) {
+    list_node<T>* new_node = create_node(value);
+    link_before(pos.node, new_node);
+    ++size_;
+    return iterator(new_node);
+}
+```
+
+erase 是反过来——"摘除 + 销毁 + size--"：
+
+```cpp
+iterator erase(const_iterator pos) {
+    list_node_base* p = const_cast<list_node_base*>(pos.node);
+    list_node_base* next_node = p->next;
+    p->prev->next = p->next;    // 前驱跳过 p
+    p->next->prev = p->prev;    // 后继跳过 p
+    destroy_node(static_cast<list_node<T>*>(p));
+    --size_;
+    return iterator(next_node);
+}
+```
+
+然后 push/pop 全部复用：
+
+```cpp
+void push_back(const value_type& value)  { insert(end(), value); }
+void push_front(const value_type& value) { insert(begin(), value); }
+void pop_back()  { erase(--end()); }
+void pop_front() { erase(begin()); }
+```
+
+## swap 和移动构造的特殊性
+
+### 为什么 list 的 swap 比 vector 复杂？
+
+vector 的 swap 交换三个指针就完事。list 不行——因为数据节点的首尾会**指回哨兵**，而哨兵是栈上对象，地址固定：
+
+```
+list a:   sentinel_a ←→ [1] ←→ [2] ←→ sentinel_a
+              ↑                              ↑
+        [1].prev 指向这里            [2].next 指向这里
+```
+
+如果只交换哨兵内部的 prev/next，节点的反向指针还是指向旧哨兵，链就断了。所以交换后必须**修复反向引用**：
+
+```cpp
+// 交换 + 修复
+mystl::swap(sentinel_.next, other.sentinel_.next);
+mystl::swap(sentinel_.prev, other.sentinel_.prev);
+sentinel_.next->prev = &sentinel_;           // 新首节点指回自己的哨兵
+sentinel_.prev->next = &sentinel_;           // 新尾节点指回自己的哨兵
+other.sentinel_.next->prev = &other.sentinel_;
+other.sentinel_.prev->next = &other.sentinel_;
+```
+
+还有一个边界——如果其中一个是空 list。空 list 的哨兵指向自己，交换后空的那方需要恢复"指向自己"的状态。所以实现中分了三种情况（都空、一空一非空、都非空）。
+
+### 移动构造
+
+同样的问题——不能像 vector 那样直接偷指针：
+
+```cpp
+list(list&& other) noexcept : list() {   // 先初始化为空
+    if (!other.empty()) {
+        sentinel_.next = other.sentinel_.next;
+        sentinel_.prev = other.sentinel_.prev;
+        sentinel_.next->prev = &sentinel_;       // 修复：指向新哨兵
+        sentinel_.prev->next = &sentinel_;
+        size_ = other.size_;
+        other.sentinel_.next = &other.sentinel_;  // other 变空
+        other.sentinel_.prev = &other.sentinel_;
+        other.size_ = 0;
+    }
+}
+```
+
+偷的是整条节点链，但首尾节点的指针要从旧哨兵修正为新哨兵。仍然是 O(1)——只修 4 个指针，不遍历节点。
+
+## create_node 和 destroy_node
+
+和 vector 的 construct/destroy + allocate/deallocate 对应：
+
+```cpp
+// 分配 + 构造
+template <class... Args>
+list_node<T>* create_node(Args&&... args) {
+    list_node<T>* node = Alloc::allocate(1);
+    mystl::construct(&node->data, mystl::forward<Args>(args)...);
+    return node;
+}
+
+// 析构 + 释放
+void destroy_node(list_node<T>* node) {
+    mystl::destroy(&node->data);
+    Alloc::deallocate(node, 1);
+}
+```
+
+vector 一次分配一大块内存，多个元素共用。list 每次分配一个节点——每次 push_back 都会调用 `allocate(1)`。
+
+```
+vector push_back 1000 次：~7 次分配（16→32→64→...→1024）
+list push_back 1000 次：1000 次分配，每次一个节点
+```
+
+这就是为什么实际性能中 vector 通常比 list 快——连续内存对 CPU 缓存友好，大块分配比频繁小分配高效。
+
+## 单元测试
+
+```cpp
+#include "list.h"
+#include <gtest/gtest.h>
+#include <string>
+
+TEST(ListTest, DefaultConstruct) {
+  mystl::list<int> l;
+  EXPECT_EQ(l.size(), 0);
+  EXPECT_TRUE(l.empty());
+}
+
+TEST(ListTest, CopyConstruct) {
+  mystl::list<int> a(3, 7);
+  mystl::list<int> b(a);
+  EXPECT_EQ(b.size(), 3);
+  EXPECT_EQ(b.front(), 7);
+  b.front() = 99;
+  EXPECT_EQ(a.front(), 7);  // a 不受影响
+}
+
+TEST(ListTest, MoveConstruct) {
+  mystl::list<std::string> a(2, "hello");
+  mystl::list<std::string> b(mystl::move(a));
+  EXPECT_EQ(b.size(), 2);
+  EXPECT_EQ(b.front(), "hello");
+  EXPECT_EQ(a.size(), 0);  // a 被掏空
+}
+
+TEST(ListTest, PushBackAndFront) {
+  mystl::list<int> l;
+  l.push_back(2);
+  l.push_front(1);
+  l.push_back(3);
+  EXPECT_EQ(l.front(), 1);
+  EXPECT_EQ(l.back(), 3);
+}
+
+TEST(ListTest, EmplaceBack) {
+  mystl::list<std::string> l;
+  l.emplace_back(3, 'x');  // "xxx"
+  EXPECT_EQ(l.front(), "xxx");
+}
+
+TEST(ListTest, InsertMiddle) {
+  mystl::list<int> l;
+  l.push_back(1);
+  l.push_back(3);
+  auto it = l.begin();
+  ++it;
+  l.insert(it, 2);  // [1, 2, 3]
+
+  it = l.begin();
+  EXPECT_EQ(*it, 1); ++it;
+  EXPECT_EQ(*it, 2); ++it;
+  EXPECT_EQ(*it, 3);
+}
+
+TEST(ListTest, EraseSingle) {
+  mystl::list<int> l;
+  l.push_back(1);
+  l.push_back(2);
+  l.push_back(3);
+  auto it = l.begin();
+  ++it;
+  it = l.erase(it);  // erase 2, returns iterator to 3
+  EXPECT_EQ(*it, 3);
+  EXPECT_EQ(l.size(), 2);
+}
+
+TEST(ListTest, Swap) {
+  mystl::list<int> a(3, 1);
+  mystl::list<int> b(2, 2);
+  a.swap(b);
+  EXPECT_EQ(a.size(), 2);
+  EXPECT_EQ(a.front(), 2);
+  EXPECT_EQ(b.size(), 3);
+  EXPECT_EQ(b.front(), 1);
+}
+
+TEST(ListTest, RangeFor) {
+  mystl::list<int> l;
+  l.push_back(1);
+  l.push_back(2);
+  l.push_back(3);
+  int sum = 0;
+  for (int x : l) sum += x;
+  EXPECT_EQ(sum, 6);
+}
+
+TEST(ListTest, ManyElements) {
+  mystl::list<int> l;
+  for (int i = 0; i < 1000; ++i)
+    l.push_back(i);
+  EXPECT_EQ(l.size(), 1000);
+  EXPECT_EQ(l.front(), 0);
+  EXPECT_EQ(l.back(), 999);
+}
+```
+
+## 后续扩展
+
+list 还有一些 vector 没有的链表特有操作，标准库的 `std::list` 提供了：
+
+- **`splice`** — 把另一个 list 的节点直接移过来，O(1)，不需要拷贝
+- **`merge`** — 合并两个有序 list
+- **`sort`** — 链表的归并排序（不能用 `std::sort`，因为需要随机访问迭代器）
+- **`unique`** — 去除相邻重复元素
+- **`reverse`** — 反转链表
+
+接下来是 Phase 2 的最后一个序列容器：**deque（双端队列）**——结合了 vector 和 list 的优点，两端 O(1) 插入且支持随机访问。

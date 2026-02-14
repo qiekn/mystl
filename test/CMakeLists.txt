@@ -7,6 +7,7 @@ add_executable(mystl_test
   construct_test.cpp
   allocator_test.cpp
   vector_test.cpp
+  list_test.cpp
 )
 
 # 包含自己实现的 STL 头文件目录
