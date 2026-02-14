@@ -1,0 +1,841 @@
+---
+title: "vector.h - 动态数组"
+date: "2025-02-14"
+tags: ["stl", "container", "vector", "memory", "move-semantics"]
+order: 6
+toc: true
+---
+
+## 为什么需要 vector？
+
+C++ 的原生数组有两个致命问题：大小在编译时确定，不能自动扩容。
+
+```cpp
+int arr[100];    // 编译时就固定了 100
+arr[100] = 1;   // 越界，未定义行为
+```
+
+`vector` 是一个**动态数组**：底层内存连续（和原生数组一样快），但可以自动扩容。它是 STL 中最常用的容器。
+
+## 核心概念：三个指针
+
+vector 的全部状态由三个指针描述：
+
+```
+begin_                    end_              cap_
+  |                        |                 |
+  v                        v                 v
+  [ 1 ][ 2 ][ 3 ][ 4 ][ 5 ][   ][   ][   ]
+  |<------- size -------->|
+  |<------------- capacity -------------->|
+```
+
+- **`begin_`** — 指向第一个元素
+- **`end_`** — 指向最后一个元素的**下一个位置**（past-the-end，STL 统一约定）
+- **`cap_`** — 指向已分配内存的末尾
+
+由此推导：
+
+| 属性 | 计算方式 |
+|------|---------|
+| `size()` | `end_ - begin_` |
+| `capacity()` | `cap_ - begin_` |
+| `empty()` | `begin_ == end_` |
+
+`size` 是已构造对象的数量，`capacity` 是已分配内存能容纳的数量。`end_` 和 `cap_` 之间的空间是已经分配了但还没有构造对象的"空位"——这是 vector 实现高效 `push_back` 的关键。
+
+### sizeof(vector) = 24
+
+`vector` 对象本身只有这三个指针，在 64 位系统上就是 3 × 8 = 24 字节。不管里面装了多少元素，vector 对象本身的大小不变——实际数据存在堆上。
+
+```cpp
+sizeof(std::vector<int>)    // 24
+sizeof(std::vector<string>) // 24，一样
+```
+
+## 2 倍扩容策略
+
+当 `push_back` 发现 `end_ == cap_`（满了），需要 reallocate。新 capacity 怎么定？
+
+```cpp
+size_type grow_size() const {
+    return capacity() == 0 ? 16 : capacity() * 2;
+}
+```
+
+- 空 vector 第一次分配 16 个位置
+- 之后每次翻倍：16 → 32 → 64 → 128 → ...
+
+为什么是 2 倍？这是 **摊还分析（amortized analysis）** 的结果。 (或者叫平摊分析，梦回《算法导论》...)
+
+假设连续 push_back n 个元素，触发扩容时需要搬移所有已有元素。搬移总次数：
+
+```
+16 + 32 + 64 + ... + n ≈ 2n
+```
+
+总搬移量 ≈ 2n，平均到 n 次 push_back 上，每次摊还 O(1)。如果每次只增长 1 个位置，总搬移量就是 1 + 2 + 3 + ... + n = O(n²)。
+
+## reallocate — 扩容的完整过程
+
+扩容分三个阶段：
+
+```cpp
+void reallocate(size_type new_cap) {
+    const size_type old_size = size();
+    iterator new_begin = Alloc::allocate(new_cap);          // 阶段1
+    for (size_type i = 0; i < old_size; ++i)
+        mystl::construct(new_begin + i, mystl::move(*(begin_ + i)));  // 阶段2
+    destroy_and_deallocate();                                // 阶段3
+    begin_ = new_begin;
+    end_ = new_begin + old_size;
+    cap_ = new_begin + new_cap;
+}
+```
+
+假设当前 `[1, 2, 3]`，capacity = 3，要 push_back(4)：
+
+**阶段 1：分配新内存**
+
+```
+旧内存：[ 1 ][ 2 ][ 3 ]
+新内存：[   ][   ][   ][   ][   ][   ]    ← 6 个空位
+```
+
+**阶段 2：move 旧元素到新内存**
+
+```
+旧内存：[ ? ][ ? ][ ? ]    ← 被 move 走了
+新内存：[ 1 ][ 2 ][ 3 ][   ][   ][   ]
+```
+
+**阶段 3：销毁旧内存**
+
+```cpp
+void destroy_and_deallocate() {
+    if (begin_ != nullptr) {
+        mystl::destroy(begin_, end_);        // 逐个析构
+        Alloc::deallocate(begin_, capacity()); // 释放内存
+    }
+}
+```
+
+```
+旧内存：[已释放]
+新内存：[ 1 ][ 2 ][ 3 ][   ][   ][   ]
+         ^              ^              ^
+       begin_         end_           cap_
+```
+
+### 为什么用 move 而不是 copy？
+
+对于 `int` 这种 trivial 类型，move 和 copy 一样。但对于 `string`，区别巨大。
+
+string 对象本身只存 `{ptr, size, cap}`，真正的字符数据在堆上另一块内存：
+
+```
+vector<string> 内存布局：
+
+begin_
+  |
+  v
+  [ ptr | size | cap ][ ptr | size | cap ]
+    |                    |
+    v                    v
+   "hello"(堆)         "world"(堆)
+```
+
+- **copy** 一个 string：在堆上分配新内存，逐字节复制字符数据
+- **move** 一个 string：把 ptr 偷过来，旧对象置空。O(1)，不管字符串多长
+
+扩容时用 move，只是复制每个 string 对象的三个字段（指针+元数据），堆上的字符数据**完全不动**。
+
+## 实现步骤
+
+### 第一步：成员变量和类型别名
+
+(依旧是 **Big 5** —— 侯捷黑话)
+
+```cpp
+template <class T, class Alloc = mystl::allocator<T>>
+class vector {
+public:
+  typedef T         value_type;
+  typedef T*        iterator;
+  typedef const T*  const_iterator;
+  typedef T&        reference;
+  typedef const T&  const_reference;
+  typedef size_t    size_type;
+  typedef ptrdiff_t difference_type;
+
+private:
+  iterator begin_;
+  iterator end_;
+  iterator cap_;
+};
+```
+
+`Alloc` 默认是 `mystl::allocator<T>`，容器通过它分配和释放内存。这是 STL 的设计——容器不直接 `new`/`delete`，而是通过 allocator，方便替换内存策略。
+
+iterator 就是 `T*`——vector 的迭代器就是原始指针，因为底层内存是连续的。
+
+### 第二步：构造函数
+
+**默认构造**——零开销，不分配内存：
+
+```cpp
+vector() noexcept : begin_(nullptr), end_(nullptr), cap_(nullptr) {}
+```
+
+**指定大小**——`explicit` 防止 `vector<int> v = 5` 这种意外的隐式转换：
+
+```cpp
+explicit vector(size_type n) : begin_(nullptr), end_(nullptr), cap_(nullptr) {
+    fill_init(n, value_type());
+}
+```
+
+`fill_init` 分配刚好 n 个位置，逐个构造：
+
+```cpp
+void fill_init(size_type n, const value_type& value) {
+    begin_ = Alloc::allocate(n);
+    cap_ = begin_ + n;
+    end_ = begin_;
+    for (size_type i = 0; i < n; ++i) {
+        mystl::construct(end_, value);
+        ++end_;
+    }
+}
+```
+
+**拷贝构造**——从另一个 vector 逐个 copy 元素：
+
+```cpp
+vector(const vector& other)
+    : begin_(nullptr), end_(nullptr), cap_(nullptr) {
+    range_init(other.begin_, other.end_);
+}
+```
+
+**移动构造**——偷走三个指针，O(1)：
+
+```cpp
+vector(vector&& other) noexcept
+    : begin_(other.begin_), end_(other.end_), cap_(other.cap_) {
+    other.begin_ = nullptr;
+    other.end_ = nullptr;
+    other.cap_ = nullptr;
+}
+```
+
+标记 `noexcept`——移动构造只是复制三个指针，不可能失败。这个标记很重要，其他容器 reallocate 时会优先选择 `noexcept` 的移动构造。
+
+### 第三步：赋值运算符
+
+**拷贝赋值**——使用 copy-and-swap 惯用法：
+
+```cpp
+vector& operator=(const vector& other) {
+    if (this != &other) {
+        vector tmp(other);   // 1. 拷贝构造临时副本
+        swap(tmp);           // 2. 交换资源
+    }                        // 3. tmp 析构，自动释放旧资源
+    return *this;
+}
+```
+
+为什么这么写？三个好处：
+1. **异常安全** — 如果拷贝 tmp 时抛异常，`this` 完全没被修改
+2. **自动清理** — 旧资源由 tmp 的析构函数释放，不需要手动管理
+3. **代码简洁** — 不需要处理各种 capacity 大小比较的情况
+
+**移动赋值**——释放自己的资源，偷走对方的：
+
+```cpp
+vector& operator=(vector&& other) noexcept {
+    if (this != &other) {
+        destroy_and_deallocate();
+        begin_ = other.begin_;
+        end_ = other.end_;
+        cap_ = other.cap_;
+        other.begin_ = nullptr;
+        other.end_ = nullptr;
+        other.cap_ = nullptr;
+    }
+    return *this;
+}
+```
+
+### 第四步：push_back 和 emplace_back
+
+```cpp
+void push_back(const value_type& value) {   // 左值版
+    if (end_ == cap_) reallocate(grow_size());
+    mystl::construct(end_, value);           // 拷贝构造
+    ++end_;
+}
+
+void push_back(value_type&& value) {         // 右值版
+    if (end_ == cap_) reallocate(grow_size());
+    mystl::construct(end_, mystl::move(value));  // 移动构造
+    ++end_;
+}
+```
+
+两个重载通过参数类型自动选择：
+
+```cpp
+std::string s = "hello";
+v.push_back(s);                    // s 是左值 → 拷贝
+v.push_back(std::string("world")); // 临时对象 → 移动
+```
+
+`emplace_back` 接受构造参数，直接在 vector 内存里原地构造，不需要先创建临时对象：
+
+```cpp
+template <class... Args>
+void emplace_back(Args&&... args) {
+    if (end_ == cap_) reallocate(grow_size());
+    mystl::construct(end_, mystl::forward<Args>(args)...);
+    ++end_;
+}
+```
+
+```cpp
+v.emplace_back(3, 'x');   // 直接在 end_ 位置调用 string(3, 'x')
+// 等价于 v.push_back(std::string(3, 'x'))，但省去了临时对象
+```
+
+### 第五步：insert — 中间插入
+
+```cpp
+iterator insert(const_iterator pos, const value_type& value) {
+    size_type offset = pos - begin_;       // 记住偏移量
+    if (end_ == cap_) reallocate(grow_size());
+    iterator p = begin_ + offset;         // reallocate 后重新定位
+    if (p != end_) {
+        mystl::construct(end_, mystl::move(*(end_ - 1)));
+        for (iterator it = end_ - 1; it != p; --it)
+            *it = mystl::move(*(it - 1));
+        *p = value;
+    } else {
+        mystl::construct(end_, value);
+    }
+    ++end_;
+    return p;
+}
+```
+
+关键细节：
+
+1. **先记 offset 再 reallocate**：扩容后旧地址失效，`pos` 变悬空指针。必须用偏移量重新计算位置
+2. **末尾用 construct，中间用赋值**：`end_` 位置是 raw memory，必须 construct；其他位置已有对象，用 move 赋值
+3. **从后往前挪**：避免覆盖还没搬的元素
+
+在位置 1 插入 99 的过程：
+
+```
+初始：  [ 1 ][ 2 ][ 3 ][ 4 ][   ]     p = begin_ + 1
+construct: [ 1 ][ 2 ][ 3 ][ 4 ][ 4 ]  ← 末尾 construct
+挪动：  [ 1 ][ 2 ][ 3 ][ 3 ][ 4 ]     ← 从后往前 move
+        [ 1 ][ 2 ][ 2 ][ 3 ][ 4 ]
+赋值：  [ 1 ][ 99][ 2 ][ 3 ][ 4 ]     ← *p = value
+```
+
+中间插入需要搬动 `end_ - pos` 个元素，所以是 O(n)。
+
+### 第六步：erase — 删除
+
+**删除单个元素**——和 insert 相反，从前往后挪：
+
+```cpp
+iterator erase(const_iterator pos) {
+    iterator p = begin_ + (pos - begin_);
+    for (iterator it = p; it + 1 != end_; ++it)
+        *it = mystl::move(*(it + 1));
+    --end_;
+    mystl::destroy(end_);
+    return p;
+}
+```
+
+```
+初始：  [ 1 ][ 2 ][ 3 ][ 4 ]     删除位置 1
+挪动：  [ 1 ][ 3 ][ 3 ][ 4 ]     ← 从前往后 move
+        [ 1 ][ 3 ][ 4 ][ 4 ]
+销毁：  [ 1 ][ 3 ][ 4 ][ ? ]     ← destroy + --end_
+```
+
+返回 `p`，指向删除位置的下一个元素。方便在循环中删除：
+
+```cpp
+for (auto it = v.begin(); it != v.end(); ) {
+    if (*it == 42)
+        it = v.erase(it);   // 返回下一个，不需要 ++it
+    else
+        ++it;
+}
+```
+
+**删除范围 [first, last)**——把 last 之后的元素搬到 first 位置：
+
+```cpp
+iterator erase(const_iterator first, const_iterator last) {
+    iterator f = begin_ + (first - begin_);
+    iterator l = begin_ + (last - begin_);
+    iterator new_end = f;
+    for (iterator it = l; it != end_; ++it, ++new_end)
+        *new_end = mystl::move(*it);
+    mystl::destroy(new_end, end_);
+    end_ = new_end;
+    return f;
+}
+```
+
+注意：erase 不会释放内存，capacity 保持不变。想释放多余内存需要调用 `shrink_to_fit()`。
+
+### 第七步：容量管理
+
+```cpp
+// 确保 capacity >= n，不改变 size
+void reserve(size_type n) {
+    if (n <= capacity()) return;
+    reallocate(n);
+}
+
+// 改变 size 为 n
+void resize(size_type n, const value_type& value) {
+    if (n < size()) {
+        erase(begin_ + n, end_);
+    } else if (n > size()) {
+        reserve(n);
+        while (size() < n) {
+            mystl::construct(end_, value);
+            ++end_;
+        }
+    }
+}
+
+// 释放多余内存，capacity 缩到 size
+void shrink_to_fit() {
+    if (end_ != cap_) reallocate(size());
+}
+```
+
+`reserve` 和 `resize` 的区别：
+
+```cpp
+v.reserve(100);   // size=0,   capacity=100，没有元素
+v.resize(100);    // size=100, capacity=100，100 个默认值
+```
+
+`reserve` 的典型用法——已知最终大小时，提前分配避免多次扩容：
+
+```cpp
+mystl::vector<int> v;
+v.reserve(1000);
+for (int i = 0; i < 1000; ++i)
+    v.push_back(i);    // 0 次 reallocate
+```
+
+## 完整实现
+
+```cpp
+#pragma once
+
+#include <cstddef>
+#include <stdexcept>
+
+#include "allocator.h"
+#include "construct.h"
+#include "util.h"
+
+namespace mystl {
+
+template <class T, class Alloc = mystl::allocator<T>>
+class vector {
+public:
+  typedef T         value_type;
+  typedef T*        iterator;
+  typedef const T*  const_iterator;
+  typedef T&        reference;
+  typedef const T&  const_reference;
+  typedef size_t    size_type;
+  typedef ptrdiff_t difference_type;
+
+  // -- Constructors --
+
+  vector() noexcept : begin_(nullptr), end_(nullptr), cap_(nullptr) {}
+
+  explicit vector(size_type n) : begin_(nullptr), end_(nullptr), cap_(nullptr) {
+    fill_init(n, value_type());
+  }
+
+  vector(size_type n, const value_type& value)
+      : begin_(nullptr), end_(nullptr), cap_(nullptr) {
+    fill_init(n, value);
+  }
+
+  vector(const vector& other)
+      : begin_(nullptr), end_(nullptr), cap_(nullptr) {
+    range_init(other.begin_, other.end_);
+  }
+
+  vector(vector&& other) noexcept
+      : begin_(other.begin_), end_(other.end_), cap_(other.cap_) {
+    other.begin_ = nullptr;
+    other.end_ = nullptr;
+    other.cap_ = nullptr;
+  }
+
+  ~vector() { destroy_and_deallocate(); }
+
+  // -- Assignment --
+
+  vector& operator=(const vector& other) {
+    if (this != &other) {
+      vector tmp(other);
+      swap(tmp);
+    }
+    return *this;
+  }
+
+  vector& operator=(vector&& other) noexcept {
+    if (this != &other) {
+      destroy_and_deallocate();
+      begin_ = other.begin_;
+      end_ = other.end_;
+      cap_ = other.cap_;
+      other.begin_ = nullptr;
+      other.end_ = nullptr;
+      other.cap_ = nullptr;
+    }
+    return *this;
+  }
+
+  // -- Element access --
+
+  reference operator[](size_type n) { return *(begin_ + n); }
+  const_reference operator[](size_type n) const { return *(begin_ + n); }
+
+  reference at(size_type n) {
+    if (n >= size()) throw std::out_of_range("vector::at");
+    return *(begin_ + n);
+  }
+  const_reference at(size_type n) const {
+    if (n >= size()) throw std::out_of_range("vector::at");
+    return *(begin_ + n);
+  }
+
+  reference front() { return *begin_; }
+  const_reference front() const { return *begin_; }
+
+  reference back() { return *(end_ - 1); }
+  const_reference back() const { return *(end_ - 1); }
+
+  iterator data() noexcept { return begin_; }
+  const_iterator data() const noexcept { return begin_; }
+
+  // -- Iterators --
+
+  iterator begin() noexcept { return begin_; }
+  const_iterator begin() const noexcept { return begin_; }
+
+  iterator end() noexcept { return end_; }
+  const_iterator end() const noexcept { return end_; }
+
+  // -- Capacity --
+
+  size_type size() const noexcept { return static_cast<size_type>(end_ - begin_); }
+  size_type capacity() const noexcept { return static_cast<size_type>(cap_ - begin_); }
+  bool empty() const noexcept { return begin_ == end_; }
+
+  void reserve(size_type n) {
+    if (n <= capacity()) return;
+    reallocate(n);
+  }
+
+  void resize(size_type n) { resize(n, value_type()); }
+
+  void resize(size_type n, const value_type& value) {
+    if (n < size()) {
+      erase(begin_ + n, end_);
+    } else if (n > size()) {
+      reserve(n);
+      while (size() < n) {
+        mystl::construct(end_, value);
+        ++end_;
+      }
+    }
+  }
+
+  void shrink_to_fit() {
+    if (end_ != cap_) reallocate(size());
+  }
+
+  // -- Modifiers --
+
+  void push_back(const value_type& value) {
+    if (end_ == cap_) reallocate(grow_size());
+    mystl::construct(end_, value);
+    ++end_;
+  }
+
+  void push_back(value_type&& value) {
+    if (end_ == cap_) reallocate(grow_size());
+    mystl::construct(end_, mystl::move(value));
+    ++end_;
+  }
+
+  template <class... Args>
+  void emplace_back(Args&&... args) {
+    if (end_ == cap_) reallocate(grow_size());
+    mystl::construct(end_, mystl::forward<Args>(args)...);
+    ++end_;
+  }
+
+  void pop_back() {
+    --end_;
+    mystl::destroy(end_);
+  }
+
+  iterator insert(const_iterator pos, const value_type& value) {
+    size_type offset = pos - begin_;
+    if (end_ == cap_) reallocate(grow_size());
+    iterator p = begin_ + offset;
+    if (p != end_) {
+      mystl::construct(end_, mystl::move(*(end_ - 1)));
+      for (iterator it = end_ - 1; it != p; --it)
+        *it = mystl::move(*(it - 1));
+      *p = value;
+    } else {
+      mystl::construct(end_, value);
+    }
+    ++end_;
+    return p;
+  }
+
+  template <class... Args>
+  iterator emplace(const_iterator pos, Args&&... args) {
+    size_type offset = pos - begin_;
+    if (end_ == cap_) reallocate(grow_size());
+    iterator p = begin_ + offset;
+    if (p != end_) {
+      mystl::construct(end_, mystl::move(*(end_ - 1)));
+      for (iterator it = end_ - 1; it != p; --it)
+        *it = mystl::move(*(it - 1));
+      mystl::destroy(p);
+      mystl::construct(p, mystl::forward<Args>(args)...);
+    } else {
+      mystl::construct(end_, mystl::forward<Args>(args)...);
+    }
+    ++end_;
+    return p;
+  }
+
+  iterator erase(const_iterator pos) {
+    iterator p = begin_ + (pos - begin_);
+    for (iterator it = p; it + 1 != end_; ++it)
+      *it = mystl::move(*(it + 1));
+    --end_;
+    mystl::destroy(end_);
+    return p;
+  }
+
+  iterator erase(const_iterator first, const_iterator last) {
+    iterator f = begin_ + (first - begin_);
+    iterator l = begin_ + (last - begin_);
+    iterator new_end = f;
+    for (iterator it = l; it != end_; ++it, ++new_end)
+      *new_end = mystl::move(*it);
+    mystl::destroy(new_end, end_);
+    end_ = new_end;
+    return f;
+  }
+
+  void clear() noexcept {
+    mystl::destroy(begin_, end_);
+    end_ = begin_;
+  }
+
+  void swap(vector& other) noexcept {
+    mystl::swap(begin_, other.begin_);
+    mystl::swap(end_, other.end_);
+    mystl::swap(cap_, other.cap_);
+  }
+
+private:
+  iterator begin_;
+  iterator end_;
+  iterator cap_;
+
+  void destroy_and_deallocate() {
+    if (begin_ != nullptr) {
+      mystl::destroy(begin_, end_);
+      Alloc::deallocate(begin_, capacity());
+    }
+  }
+
+  size_type grow_size() const {
+    return capacity() == 0 ? 16 : capacity() * 2;
+  }
+
+  void reallocate(size_type new_cap) {
+    const size_type old_size = size();
+    iterator new_begin = Alloc::allocate(new_cap);
+    for (size_type i = 0; i < old_size; ++i)
+      mystl::construct(new_begin + i, mystl::move(*(begin_ + i)));
+    destroy_and_deallocate();
+    begin_ = new_begin;
+    end_ = new_begin + old_size;
+    cap_ = new_begin + new_cap;
+  }
+
+  void fill_init(size_type n, const value_type& value) {
+    begin_ = Alloc::allocate(n);
+    cap_ = begin_ + n;
+    end_ = begin_;
+    for (size_type i = 0; i < n; ++i) {
+      mystl::construct(end_, value);
+      ++end_;
+    }
+  }
+
+  void range_init(const_iterator first, const_iterator last) {
+    size_type n = static_cast<size_type>(last - first);
+    begin_ = Alloc::allocate(n);
+    cap_ = begin_ + n;
+    end_ = begin_;
+    for (; first != last; ++first) {
+      mystl::construct(end_, *first);
+      ++end_;
+    }
+  }
+};
+
+}  // namespace mystl
+```
+
+## 单元测试
+
+```cpp
+#include "vector.h"
+#include <gtest/gtest.h>
+#include <string>
+
+// -- Constructor tests --
+
+TEST(VectorTest, DefaultConstruct) {
+  mystl::vector<int> v;
+  EXPECT_EQ(v.size(), 0);
+  EXPECT_EQ(v.capacity(), 0);
+  EXPECT_TRUE(v.empty());
+}
+
+TEST(VectorTest, ConstructWithSize) {
+  mystl::vector<int> v(5);
+  EXPECT_EQ(v.size(), 5);
+  for (size_t i = 0; i < 5; ++i)
+    EXPECT_EQ(v[i], 0);
+}
+
+TEST(VectorTest, CopyConstruct) {
+  mystl::vector<int> a(3, 7);
+  mystl::vector<int> b(a);
+  EXPECT_EQ(b.size(), 3);
+  EXPECT_EQ(b[0], 7);
+  b[0] = 99;
+  EXPECT_EQ(a[0], 7);  // a 不受影响
+}
+
+TEST(VectorTest, MoveConstruct) {
+  mystl::vector<std::string> a(2, "hello");
+  mystl::vector<std::string> b(mystl::move(a));
+  EXPECT_EQ(b.size(), 2);
+  EXPECT_EQ(b[0], "hello");
+  EXPECT_EQ(a.size(), 0);  // a 被掏空
+}
+
+// -- Modifier tests --
+
+TEST(VectorTest, PushBack) {
+  mystl::vector<int> v;
+  for (int i = 0; i < 100; ++i)
+    v.push_back(i);
+  EXPECT_EQ(v.size(), 100);
+  EXPECT_EQ(v[0], 0);
+  EXPECT_EQ(v[99], 99);
+}
+
+TEST(VectorTest, EmplaceBack) {
+  mystl::vector<std::string> v;
+  v.emplace_back("hello");
+  v.emplace_back(3, 'x');  // string(3, 'x') = "xxx"
+  EXPECT_EQ(v[0], "hello");
+  EXPECT_EQ(v[1], "xxx");
+}
+
+TEST(VectorTest, Insert) {
+  mystl::vector<int> v;
+  v.push_back(1);
+  v.push_back(3);
+  v.insert(v.begin() + 1, 2);
+  EXPECT_EQ(v[0], 1);
+  EXPECT_EQ(v[1], 2);
+  EXPECT_EQ(v[2], 3);
+}
+
+TEST(VectorTest, EraseSingle) {
+  mystl::vector<int> v;
+  v.push_back(1);
+  v.push_back(2);
+  v.push_back(3);
+  auto it = v.erase(v.begin() + 1);
+  EXPECT_EQ(v.size(), 2);
+  EXPECT_EQ(*it, 3);
+}
+
+TEST(VectorTest, EraseRange) {
+  mystl::vector<int> v;
+  for (int i = 0; i < 5; ++i) v.push_back(i);
+  v.erase(v.begin() + 1, v.begin() + 4);
+  EXPECT_EQ(v.size(), 2);
+  EXPECT_EQ(v[0], 0);
+  EXPECT_EQ(v[1], 4);
+}
+
+// -- Capacity tests --
+
+TEST(VectorTest, Reserve) {
+  mystl::vector<int> v;
+  v.reserve(100);
+  EXPECT_GE(v.capacity(), 100u);
+  EXPECT_EQ(v.size(), 0);  // size 不变
+}
+
+TEST(VectorTest, Resize) {
+  mystl::vector<int> v(3, 1);
+  v.resize(5, 2);
+  EXPECT_EQ(v.size(), 5);
+  EXPECT_EQ(v[3], 2);
+  v.resize(2);
+  EXPECT_EQ(v.size(), 2);
+}
+
+TEST(VectorTest, AutoGrow) {
+  mystl::vector<int> v;
+  for (int i = 0; i < 1000; ++i)
+    v.push_back(i);
+  EXPECT_EQ(v.size(), 1000);
+  for (int i = 0; i < 1000; ++i)
+    EXPECT_EQ(v[i], i);
+}
+```
+
+## 后续扩展
+
+vector 是最简单的序列容器。接下来的 Phase 2 还有：
+
+- **list.h** — 双向链表。插入/删除 O(1)，但不支持随机访问。和 vector 形成互补
+- **deque.h** — 双端队列。两端 push/pop 都是 O(1)，内部用分段连续内存实现
